@@ -262,6 +262,8 @@ if "messages" not in st.session_state:
 NO_INFO_ANSWER = "מצטער, אין לי מידע מדויק על כך באתר הפניקס. אפשר לפנות לשירות הלקוחות של הפניקס."
 SIMILARITY_THRESHOLD = 0.65
 MATCH_COUNT = 8
+MIN_CONTENT_CHARS = 60  # קטע עם פחות טקסט אמיתי מזה (בלי קישורים ותמונות) לא נשלח למודל
+ANSWER_TEMPERATURE = 0  # תשובה זהה לאותה שאלה, בלי התנודות שגרמו פעם לסירוב ופעם לתשובה
 FETCH_COUNT = 24  # שולפים יותר, כי פסקאות זהות חוזרות בעמודים שונים ואחרי הסרת הכפילויות נשארים MATCH_COUNT קטעים
 HISTORY_MESSAGES = 4
 NO_SOURCES_MARK = "[[NO_SOURCES]]"
@@ -333,10 +335,22 @@ def build_prompt(context, history, question):
     )
 
 
+def content_text(text):
+    """הטקסט האמיתי של קטע: בלי תמונות, בלי כתובות של קישורים (נשאר שם הקישור) ובלי סימוני markdown."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", lambda m: m.group(1), text)
+    text = re.sub(r"[#*_|>\\-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def dedupe_docs(docs, limit=MATCH_COUNT):
-    """מסיר קטעים עם תוכן זהה (אותה פסקה חוזרת בעמודי משנה), שומר את הראשון לפי הרלוונטיות ומחזיר עד limit קטעים."""
+    """מסנן את תוצאות החיפוש: מסיר קטעים שהם בעיקר קישור או תמונה (פחות מ-MIN_CONTENT_CHARS תווי טקסט, כמו "[לפרטים נוספים](...)"),
+    כי הם תופסים מקום בהקשר של המודל בלי להגדיר כלום; ומסיר קטעים עם תוכן זהה (אותה פסקה חוזרת בעמודי משנה).
+    שומר את הראשון לפי הרלוונטיות ומחזיר עד limit קטעים."""
     seen, result = set(), []
     for doc in docs:
+        if len(content_text(doc["content"])) < MIN_CONTENT_CHARS:
+            continue
         key = re.sub(r"\s+", " ", doc["content"]).strip()
         if key in seen:
             continue
@@ -689,7 +703,7 @@ def stream_answer(ai_prompt):
                 model="gemini-3.8-flash",
                 contents=ai_prompt,
                 # בלי "חשיבה" פנימית של המודל: התשובה מגיעה אחרי ~2 שניות במקום ~11, והתשובות נשענות ממילא על הקטעים שבפרומפט
-                config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0)),
+                config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0), temperature=ANSWER_TEMPERATURE),
             ))
             first = next(stream, None)
             break
