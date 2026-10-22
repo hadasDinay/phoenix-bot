@@ -10,6 +10,7 @@ import itertools
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from google import genai
+from google.genai import types
 
 # הגדרות עמוד
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")  # לוגו לבן ל-Header הכהה
@@ -612,7 +613,9 @@ def stream_answer(ai_prompt):
         try:
             stream = iter(gemini_client.models.generate_content_stream(
                 model="gemini-3.8-flash",
-                contents=ai_prompt
+                contents=ai_prompt,
+                # בלי "חשיבה" פנימית של המודל: התשובה מגיעה אחרי ~2 שניות במקום ~11, והתשובות נשענות ממילא על הקטעים שבפרומפט
+                config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0)),
             ))
             first = next(stream, None)
             break
