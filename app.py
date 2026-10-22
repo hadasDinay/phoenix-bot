@@ -215,6 +215,7 @@ st.markdown(f"""
     }}
     .fnx-term-custom:hover::after, .fnx-term-custom:hover::before,
     .fnx-term-custom.fnx-open::after, .fnx-term-custom.fnx-open::before {{ opacity: 1; visibility: visible; }}
+    body[data-fnx-busy="1"] [data-testid="stChatInputSubmitButton"] {{ opacity: 0.35; cursor: not-allowed; }}
     a.fnx-source:hover {{ background: {ORANGE}; color: #fff !important; }}
     .fnx-footer {{ text-align: center; color: #9A9EB2; font-size: 0.78rem; margin-top: 24px; }}
     </style>
@@ -346,6 +347,42 @@ def dedupe_docs(docs, limit=MATCH_COUNT):
     return result
 
 
+REWRITE_PROMPT = """You rewrite the customer's last message into one standalone Hebrew search query for an insurance website.
+Use the conversation only to resolve references (it, this, that, "and what about...", missing subject).
+If the last message is already self-contained, or starts a new topic, return it unchanged.
+Do not answer it, do not add facts, do not explain. Output only the query text.
+
+<conversation>
+{history}
+</conversation>
+
+<last_message>
+{question}
+</last_message>"""
+
+
+def standalone_question(history, question):
+    """משכתב שאלת המשך לשאלה עצמאית לצורך החיפוש במאגר ("אז זה בעצם לא יומי אלא לכמה ימים" -> "האם ביטוח יומי לרכב הוא ליום אחד או לכמה ימים?").
+    בכישלון (שגיאה, תשובה ריקה או ארוכה מדי) חוזרים לשאלה המקורית; האחראי לתשובה נשאר המודל הראשי, שרואה את ההיסטוריה המלאה."""
+    if not history:
+        return question
+    convo = "\n".join(
+        f'{"Customer" if m["role"] == "user" else "Pini"}: {m["content"][:400]}' for m in history
+    )
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=REWRITE_PROMPT.format(history=convo, question=question),
+            config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0), temperature=0),
+        )
+        rewritten = (response.text or "").strip().strip('"')
+        if rewritten and len(rewritten) <= max(300, len(question) * 4):
+            return rewritten
+    except Exception:
+        pass
+    return question
+
+
 def collect_sources(docs):
     """URLs ייחודיים מתוך ה-metadata של הקטעים שנמצאו, לפי סדר הרלוונטיות."""
     seen, result = set(), []
@@ -412,6 +449,10 @@ _GLOSSARY_RE = re.compile(
 )
 
 
+# אחרי המונח בא פועל הגדרה ("... הוא", "... היא", "... הינו", "... מוגדר כ", "... פירושו"), כלומר התשובה מסבירה אותו בעצמה
+_DEFINES_RE = re.compile(r"[\s*_]*(?:הוא|היא|הינו|הינה|הם|הן|מוגדר|מוגדרת|פירושו|פירושה)(?![\w])")
+
+
 def apply_glossary(text):
     """מחליף מונח מהמילון ב-span עם ההגדרה המלאה ב-data-def, שמוצגת בבועה בריחוף (ראו install_glossary_bubble).
     רק ההופעה הראשונה של כל מונח בתשובה מודגשת; הופעות נוספות נשארות טקסט רגיל. כינויים של אותו מונח (ריסק) נחשבים למונח אחד."""
@@ -422,9 +463,42 @@ def apply_glossary(text):
         definition = GLOSSARY[term]
         if definition in seen:
             return match.group(0)
+        # התשובה עצמה כבר מגדירה את המונח ("ביטוח אובדן כושר עבודה הוא ביטוח ש..."): בועה נוספת רק תחזור על אותו הסבר
+        if _DEFINES_RE.match(match.string, match.end()):
+            seen.add(definition)
+            return match.group(0)
         seen.add(definition)
         return f'{prefix}<span class="fnx-term-custom" data-def="{html.escape(definition, quote=True)}">{term}</span>'
     return _GLOSSARY_RE.sub(wrap, text)
+
+
+def install_send_lock(is_busy):
+    """בזמן שהבוט עונה אפשר להקליד בשדה אבל אי אפשר לשלוח (disabled של Streamlit חוסם גם הקלדה). בכל הרצה מעדכנים ב-JS את מצב העבודה
+    (data-fnx-busy על ה-body). מאזיני Enter/לחיצה על כפתור השליחה נרשמים פעם אחת בשלב ה-capture וחוסמים שליחה בזמן עבודה.
+    ה-iframe הזה מוחלף בכל הרצה (התוכן שלו משתנה), והמאזינים שנוצרו בתוכו היו מפסיקים לפעול כשהוא נמחק, ולכן הם מוזרקים
+    כ-script לדף האב עצמו. ה-CSS (בראש הקובץ) מחווירה את כפתור השליחה כדי שיהיה ברור שהוא לא פעיל."""
+    components.html(f"""
+        <script>
+        const w = window.parent, d = w.document;
+        d.body.setAttribute('data-fnx-busy', '{1 if is_busy else 0}');
+        if (!d.getElementById('fnx-send-lock')) {{
+            const code = `
+                const busy = () => document.body.getAttribute('data-fnx-busy') === '1';
+                const stop = e => {{ e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); }};
+                document.addEventListener('keydown', e => {{
+                    if (busy() && e.key === 'Enter' && !e.shiftKey && e.target.closest && e.target.closest('[data-testid="stChatInput"]')) stop(e);
+                }}, true);
+                document.addEventListener('click', e => {{
+                    if (busy() && e.target.closest && e.target.closest('[data-testid="stChatInputSubmitButton"]')) stop(e);
+                }}, true);
+            `;
+            const el = d.createElement('script');
+            el.id = 'fnx-send-lock';
+            el.textContent = code;
+            d.head.appendChild(el);
+        }}
+        </script>
+    """, height=0)
 
 
 def install_glossary_bubble():
@@ -689,6 +763,9 @@ def collapse_sidebar(only_on_mobile=False):
     """, height=0)
 
 
+# בזמן שהבוט עונה (busy) אי אפשר לשלוח שאלה נוספת, כדי ששאלה חדשה לא תקטע את התשובה שבדרך ותיצור שאלה בלי תשובה
+busy = st.session_state.get("busy", False)
+
 with st.sidebar:
     st.markdown('<div class="side-title">שאלות נפוצות</div>', unsafe_allow_html=True)
     # Streamlit לא מאפשר expander בתוך expander, ולכן הקבוצות הן טאבים וכל נושא הוא expander בתוך הטאב.
@@ -698,12 +775,12 @@ with st.sidebar:
             for t_idx, (label, questions) in enumerate(topics):
                 with st.expander(label, expanded=(g_idx == 0 and t_idx == 0)):
                     for q_idx, q in enumerate(questions):
-                        st.button(q, key=f"faq_{g_idx}_{t_idx}_{q_idx}", on_click=ask, args=(q,))
+                        st.button(q, key=f"faq_{g_idx}_{t_idx}_{q_idx}", on_click=ask, args=(q,), disabled=busy)
 
 # מסך פתיחה: כרטיס ההיכרות של פיני (השאלות הנפוצות נמצאות רק בתפריט הצד)
 suggested = st.session_state.pop("pending", None)
 welcome = st.empty()  # מתרוקן ברגע שנשלחת הודעה, כדי שהשיחה תהיה במוקד
-if not st.session_state.messages and suggested is None:
+if not st.session_state.messages and suggested is None and not busy:
     with welcome.container():
         st.markdown(f"""
             <div class="persona">
@@ -720,7 +797,10 @@ install_glossary_bubble()
 
 # שדה ההקלדה מוצמד לתחתית המסך בכל מקרה; קוראים לו לפני השיחה כדי שסדר האלמנטים בעמוד יישאר יציב בין ריצות,
 # והשיחה נמצאת במכל אחד נפרד. אחרת Streamlit משאיר "רוחות רפאים" (מקורות של התשובה הקודמת) בתוך בועת השאלה החדשה
-chat_prompt = st.chat_input("הקלידו את השאלה שלכם כאן...")
+# בזמן שהבוט עונה אפשר להקליד אבל לא לשלוח (ראו install_send_lock); disabled של Streamlit היה חוסם גם הקלדה
+# הפרמטרים של השדה חייבים להישאר קבועים בין ההרצות (גם ה-placeholder): שינוי בהם יוצר שדה חדש והטקסט שהוקלד נמחק
+chat_prompt = st.chat_input("הקלידו את השאלה שלכם כאן...", key="chat_box")
+install_send_lock(busy)
 chat_area = st.container()
 
 # תצוגת היסטוריית השיחה
@@ -733,90 +813,112 @@ for idx, msg in enumerate(st.session_state.messages):
             st.markdown(msg["content"])
         render_sources(msg.get("sources"))
 
-if prompt := (suggested or chat_prompt):
+# שאלה חדשה: נועלים את השליחה ומרעננים, וההרצה הבאה (שבה השדה והכפתורים מושבתים) היא זו שעונה
+incoming = suggested or chat_prompt
+if incoming and not busy:
+    st.session_state.update(busy=True, processing=incoming, processing_faq=suggested is not None, proc_msg_added=False)
+    st.rerun()
+
+prompt = st.session_state.get("processing") if busy else None
+if busy and not prompt:
+    st.session_state.busy = False  # מצב נעילה בלי שאלה (למשל אחרי תקלה): משחררים
+    st.rerun()
+
+if prompt:
     welcome.empty()
 
     # בדסקטופ תפריט הצד נשאר פתוח עד שהמשתמש סוגר אותו; במובייל הוא מכסה את השיחה ולכן נסגר אחרי בחירת שאלה
-    if suggested is not None:
+    if st.session_state.get("processing_faq"):
         collapse_sidebar(only_on_mobile=True)
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with chat_area.chat_message("user", avatar=user_avatar):
-        st.markdown(prompt)
+    # אם ההרצה נקטעה והתחילה מחדש (למשל בלחיצה על טאב בתפריט), השאלה כבר בשיחה ולא מוסיפים אותה פעם שנייה
+    if not st.session_state.get("proc_msg_added"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state.proc_msg_added = True
+        with chat_area.chat_message("user", avatar=user_avatar):
+            st.markdown(prompt)
 
     scroll_to_bottom()
 
-    with chat_area.chat_message("assistant", avatar=assistant_avatar):
-        sources = []
-        final_answer = None
-        cacheable = False
-        is_faq = prompt in FAQ_QUESTIONS
-        cached = (faq_cache().get(prompt) or load_faq_answer(prompt)) if is_faq else None
-        # מכלי תשובה ומקורות שמתרוקנים במפורש בתחילת כל שאלה, כדי שלא יישארו טקסטים ישנים בשקיפות
-        answer_box, sources_box = st.empty(), st.empty()
-        answer_box.empty()
-        sources_box.empty()
-        try:
-            if cached:
-                # תשובה שמורה מוקלדת בהדרגה, בדיוק כמו תשובה חיה
-                with answer_box.container():
-                    st.write_stream(typing_effect(iter([cached["answer"]])))
-                answer_box.markdown(apply_glossary(cached["answer"]), unsafe_allow_html=True)
-                final_answer, sources = cached["answer"], cached["sources"]
-            else:
-                # הספינר רץ ברציפות מרגע השליחה ועד שהמילה הראשונה מוצגת
-                with st.spinner("הבוט חושב..."):
-                    # א. הפיכת השאלה לווקטור. שאלה נפוצה נענית ללא היסטוריה, כדי שהתשובה תהיה אחידה וניתנת לשמירה
-                    history = [] if is_faq else st.session_state.messages[:-1][-HISTORY_MESSAGES:]
-                    previous_questions = [m["content"] for m in history if m["role"] == "user"]
-                    # שאלה קצרה היא כנראה שאלת המשך: מצרפים את השאלה הקודמת לחיפוש הווקטורי
-                    search_text = prompt
-                    if previous_questions and len(prompt.split()) < 6:
-                        search_text = f"{previous_questions[-1]} {prompt}"
+    try:
+        with chat_area.chat_message("assistant", avatar=assistant_avatar):
+            sources = []
+            final_answer = None
+            cacheable = False
+            is_faq = prompt in FAQ_QUESTIONS
+            cached = (faq_cache().get(prompt) or load_faq_answer(prompt)) if is_faq else None
+            # מכלי תשובה ומקורות שמתרוקנים במפורש בתחילת כל שאלה, כדי שלא יישארו טקסטים ישנים בשקיפות
+            answer_box, sources_box = st.empty(), st.empty()
+            answer_box.empty()
+            sources_box.empty()
+            try:
+                if cached:
+                    # תשובה שמורה מוקלדת בהדרגה, בדיוק כמו תשובה חיה
+                    with answer_box.container():
+                        st.write_stream(typing_effect(iter([cached["answer"]])))
+                    answer_box.markdown(apply_glossary(cached["answer"]), unsafe_allow_html=True)
+                    final_answer, sources = cached["answer"], cached["sources"]
+                else:
+                    # הספינר רץ ברציפות מרגע השליחה ועד שהמילה הראשונה מוצגת
+                    with st.spinner("הבוט חושב..."):
+                        # א. הפיכת השאלה לווקטור. שאלה נפוצה נענית ללא היסטוריה, כדי שהתשובה תהיה אחידה וניתנת לשמירה
+                        history = [] if is_faq else st.session_state.messages[:-1][-HISTORY_MESSAGES:]
+                        # שאלת המשך ("אז זה בעצם לא יומי אלא לכמה ימים") מנוסחת מחדש כשאלה עצמאית לפני החיפוש, בכל אורך;
+                        # אחרת החיפוש לא מוצא את הנושא והבוט מסרב. בלי היסטוריה (שאלה ראשונה, שאלה נפוצה) אין שכתוב ואין עלות
+                        search_text = standalone_question(history, prompt)
 
-                    embed_response = gemini_client.models.embed_content(
-                        model="gemini-embedding-2",
-                        contents=search_text
-                    )
-                    question_vector = embed_response.embeddings[0].values
+                        embed_response = gemini_client.models.embed_content(
+                            model="gemini-embedding-2",
+                            contents=search_text
+                        )
+                        question_vector = embed_response.embeddings[0].values
 
-                    # ב. חיפוש במסד הנתונים
-                    search_response = supabase.rpc(
-                        "match_documents",
-                        {"query_embedding": question_vector, "match_threshold": SIMILARITY_THRESHOLD, "match_count": FETCH_COUNT}
-                    ).execute()
+                        # ב. חיפוש במסד הנתונים
+                        search_response = supabase.rpc(
+                            "match_documents",
+                            {"query_embedding": question_vector, "match_threshold": SIMILARITY_THRESHOLD, "match_count": FETCH_COUNT}
+                        ).execute()
 
-                    docs = dedupe_docs(search_response.data)
-                    context = "\n\n".join(f'<doc id="{n}">\n{doc["content"]}\n</doc>' for n, doc in enumerate(docs, 1)) or "(no relevant company data found)"
-                    ai_prompt = build_prompt(context, history, prompt)
+                        docs = dedupe_docs(search_response.data)
+                        context = "\n\n".join(f'<doc id="{n}">\n{doc["content"]}\n</doc>' for n, doc in enumerate(docs, 1)) or "(no relevant company data found)"
+                        ai_prompt = build_prompt(context, history, prompt)
 
-                    # ג. פתיחת הסטרימינג והמתנה למילה הראשונה. גם בלי מקטעים רלוונטיים פונים למודל, כדי שברכות ותלונות יטופלו לפי כללי האישיות
-                    st.session_state["no_sources"] = False
-                    st.session_state["used_ids"] = []
-                    stream = strip_used_marker(stream_answer(ai_prompt))
-                    first = next(stream, None)
+                        # ג. פתיחת הסטרימינג והמתנה למילה הראשונה. גם בלי מקטעים רלוונטיים פונים למודל, כדי שברכות ותלונות יטופלו לפי כללי האישיות
+                        st.session_state["no_sources"] = False
+                        st.session_state["used_ids"] = []
+                        stream = strip_used_marker(stream_answer(ai_prompt))
+                        first = next(stream, None)
 
-                with answer_box.container():
-                    streamed = st.write_stream(typing_effect(itertools.chain([] if first is None else [first], stream)))
-                final_answer = (streamed or "").strip() or NO_INFO_ANSWER
-                # בסיום הסטרימינג מחליפים את הטקסט הגולמי בגרסה עם מונחי המילון
-                answer_box.markdown(apply_glossary(final_answer), unsafe_allow_html=True)
-                if docs and not is_refusal(final_answer) and not st.session_state["no_sources"]:
-                    # רק הקטעים שהמודל סימן כבשימוש; ללא סימון תקין: הקטע הכי רלוונטי בלבד
-                    used = [docs[n - 1] for n in dict.fromkeys(st.session_state["used_ids"]) if 1 <= n <= len(docs)]
-                    sources = collect_sources(used or docs[:1])
-                    cacheable = True
-                if is_faq and cacheable:
-                    faq_cache()[prompt] = {"answer": final_answer, "sources": sources}
-                    save_faq_answer(prompt, final_answer, sources)
-        except Exception:
-            st.markdown('<div class="fnx-note">סליחה, נראה שיש לי תקלה זמנית בגישה למאגרי הפניקס. אשמח אם תנסו לשאול שוב בעוד כמה רגעים.</div>', unsafe_allow_html=True)
-            import traceback
-            traceback.print_exc()
+                    with answer_box.container():
+                        streamed = st.write_stream(typing_effect(itertools.chain([] if first is None else [first], stream)))
+                    final_answer = (streamed or "").strip() or NO_INFO_ANSWER
+                    # בסיום הסטרימינג מחליפים את הטקסט הגולמי בגרסה עם מונחי המילון
+                    answer_box.markdown(apply_glossary(final_answer), unsafe_allow_html=True)
+                    if docs and not is_refusal(final_answer) and not st.session_state["no_sources"]:
+                        # רק הקטעים שהמודל סימן כבשימוש; ללא סימון תקין: הקטע הכי רלוונטי בלבד
+                        used = [docs[n - 1] for n in dict.fromkeys(st.session_state["used_ids"]) if 1 <= n <= len(docs)]
+                        sources = collect_sources(used or docs[:1])
+                        cacheable = True
+                    if is_faq and cacheable:
+                        faq_cache()[prompt] = {"answer": final_answer, "sources": sources}
+                        save_faq_answer(prompt, final_answer, sources)
+            except Exception:
+                st.markdown('<div class="fnx-note">סליחה, נראה שיש לי תקלה זמנית בגישה למאגרי הפניקס. אשמח אם תנסו לשאול שוב בעוד כמה רגעים.</div>', unsafe_allow_html=True)
+                import traceback
+                traceback.print_exc()
 
-        if final_answer is not None:
-            with sources_box.container():
-                render_sources(sources)
-            st.session_state.messages.append(
-                {"role": "assistant", "content": final_answer, "sources": sources}
-            )
+            if final_answer is not None:
+                with sources_box.container():
+                    render_sources(sources)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": final_answer, "sources": sources}
+                )
+    except Exception:
+        # תקלה בלתי צפויה מחוץ לטיפול בשגיאות של התשובה: משחררים את הנעילה כדי שהשדה לא יישאר מושבת לתמיד.
+        # (הפסקת ריצה של Streamlit עצמו, למשל לחיצה על טאב, אינה Exception, והריצה הבאה ממשיכה לענות על אותה שאלה)
+        st.session_state.busy = False
+        st.session_state.processing = None
+        raise
+    st.session_state.busy = False
+    st.session_state.processing = None
+    st.rerun()  # מרענן כדי שהשדה והכפתורים יחזרו להיות פעילים
