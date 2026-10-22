@@ -49,9 +49,9 @@ st.markdown(f"""
     }}
     .stApp, [data-testid="stChatMessage"], [data-testid="stChatInput"] textarea {{ direction: rtl; text-align: right; }}
 
-    /* ניקוי רכיבי ברירת המחדל של Streamlit */
+    /* ניקוי רכיבי ברירת המחדל של Streamlit (כולל אינדיקטור הריצה: האיש הרץ וכפתור Stop) */
     #MainMenu, footer, [data-testid="stDecoration"], [data-testid="stToolbarActions"],
-    [data-testid="stMainMenu"], [data-testid="stAppDeployButton"] {{ display: none; }}
+    [data-testid="stMainMenu"], [data-testid="stAppDeployButton"], [data-testid="stStatusWidget"] {{ display: none !important; }}
     /* ה-header של Streamlit שקוף ולא חוסם; רק כפתור פתיחת ה-Sidebar (שבתוך ה-toolbar) נשאר לחיץ מעל הכותרת הדביקה */
     header[data-testid="stHeader"] {{ background: transparent; pointer-events: none; }}
     [data-testid="stExpandSidebarButton"] {{
@@ -186,7 +186,7 @@ st.markdown(f"""
         background: #FFF7F2; border: 1px solid #F8D9C6; color: #B8430A !important;
         border-radius: 12px; padding: 6px 14px; text-decoration: none; line-height: 1.4;
     }}
-    /* מונחים מהמילון: הדגשה בכתום, בועה קצרה ב-hover; בלחיצה (class fnx-open) אותה בועה גדלה ומציגה את ההסבר המלא.
+    /* מונחים מהמילון: הדגשה בכתום, ובריחוף נפתחת מיד בועה עם ההסבר המלא (בטלפון, שאין בו ריחוף, הלחיצה מקבעת אותה בעזרת class fnx-open).
        --fnx-shift (נקבע ב-JS) מזיז את הבועה כדי שלא תחרוג מהמסך, ו-fnx-below פותח אותה מתחת למונח כשאין מקום מעליו */
     .fnx-term-custom {{
         color: {ORANGE}; font-weight: 600; border-bottom: 2px solid {ORANGE};
@@ -194,11 +194,11 @@ st.markdown(f"""
     }}
     .fnx-term-custom:hover, .fnx-term-custom.fnx-open {{ color: #B8430A; border-bottom-color: #B8430A; }}
     .fnx-term-custom::after {{
-        content: attr(data-hover);
+        content: attr(data-def);
         position: absolute; bottom: 135%; left: 50%; transform: translateX(calc(-50% + var(--fnx-shift, 0px)));
-        width: max-content; max-width: min(260px, 70vw); white-space: normal; text-align: center;
-        background: {NAVY}; color: #fff; padding: 6px 12px; border-radius: 8px;
-        font-size: 0.9rem; font-weight: 400; line-height: 1.4;
+        width: max-content; max-width: min(320px, 80vw); white-space: normal; text-align: right;
+        background: {NAVY}; color: #fff; padding: 12px 16px; border-radius: 8px;
+        font-size: 0.9rem; font-weight: 400; line-height: 1.55;
         opacity: 0; visibility: hidden; transition: opacity 0.15s ease-in-out;
         pointer-events: none; z-index: 1000; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }}
@@ -214,9 +214,6 @@ st.markdown(f"""
     }}
     .fnx-term-custom:hover::after, .fnx-term-custom:hover::before,
     .fnx-term-custom.fnx-open::after, .fnx-term-custom.fnx-open::before {{ opacity: 1; visibility: visible; }}
-    .fnx-term-custom.fnx-open::after {{
-        content: attr(data-def); max-width: min(320px, 80vw); text-align: right; padding: 12px 16px; line-height: 1.55;
-    }}
     a.fnx-source:hover {{ background: {ORANGE}; color: #fff !important; }}
     .fnx-footer {{ text-align: center; color: #9A9EB2; font-size: 0.78rem; margin-top: 24px; }}
     </style>
@@ -415,23 +412,24 @@ _GLOSSARY_RE = re.compile(
 
 
 def apply_glossary(text):
-    """מחליף כל מונח מהמילון ב-span: 5 המילים הראשונות להגדרה ב-data-hover (בועה ב-hover) וההגדרה המלאה ב-data-def (בועה שגדלה בלחיצה, ראו install_glossary_bubble)."""
+    """מחליף מונח מהמילון ב-span עם ההגדרה המלאה ב-data-def, שמוצגת בבועה בריחוף (ראו install_glossary_bubble).
+    רק ההופעה הראשונה של כל מונח בתשובה מודגשת; הופעות נוספות נשארות טקסט רגיל. כינויים של אותו מונח (ריסק) נחשבים למונח אחד."""
+    seen = set()
+
     def wrap(match):
         prefix, term = match.group(1), match.group(2)
         definition = GLOSSARY[term]
-        words = definition.split()
-        short = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
-        return (
-            f'{prefix}<span class="fnx-term-custom" data-def="{html.escape(definition, quote=True)}" '
-            f'data-hover="{html.escape(short, quote=True)}">{term}</span>'
-        )
+        if definition in seen:
+            return match.group(0)
+        seen.add(definition)
+        return f'{prefix}<span class="fnx-term-custom" data-def="{html.escape(definition, quote=True)}">{term}</span>'
     return _GLOSSARY_RE.sub(wrap, text)
 
 
 def install_glossary_bubble():
-    """Streamlit מסנן onclick מ-HTML, לכן מתקינים פעם אחת בדף האב מאזינים (delegation): בלחיצה על מונח הבועה שלו נפתחת
-    (class fnx-open) וגדלה להסבר המלא; בלחיצה נוספת, בלחיצה במקום אחר או ב-Esc היא נסגרת.
-    בנוסף, ב-hover ובפתיחה מחושבים --fnx-shift (שלא תחרוג מהמסך) ו-fnx-below (כשאין מקום מעל המונח, למשל מתחת לכותרת הדביקה)."""
+    """Streamlit מסנן onclick מ-HTML, לכן מתקינים פעם אחת בדף האב מאזינים (delegation). הבועה נפתחת בריחוף על ידי ה-CSS.
+    ב-hover ובפתיחה מחושבים --fnx-shift (שלא תחרוג מהמסך) ו-fnx-below (כשאין מקום מעל המונח, למשל מתחת לכותרת הדביקה).
+    לחיצה (או נגיעה בטלפון) מקבעת את הבועה פתוחה (fnx-open); לחיצה נוספת, לחיצה במקום אחר או Esc סוגרים אותה."""
     components.html("""
         <script>
         const w = window.parent;
