@@ -874,7 +874,7 @@ if prompt:
                     final_answer, sources = cached["answer"], cached["sources"]
                 else:
                     # הספינר רץ ברציפות מרגע השליחה ועד שהמילה הראשונה מוצגת
-                    with st.spinner("הבוט חושב..."):
+                    with st.spinner("פיני בודק בשבילך..."):
                         # א. הפיכת השאלה לווקטור. שאלה נפוצה נענית ללא היסטוריה, כדי שהתשובה תהיה אחידה וניתנת לשמירה
                         history = [] if is_faq else st.session_state.messages[:-1][-HISTORY_MESSAGES:]
                         # שאלת המשך ("אז זה בעצם לא יומי אלא לכמה ימים") מנוסחת מחדש כשאלה עצמאית לפני החיפוש, בכל אורך;
